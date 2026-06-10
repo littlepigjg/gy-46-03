@@ -189,7 +189,26 @@ export default function AlertList() {
 
   const handleMarkFalsePositive = async (alertId, isFalsePositive) => {
     try {
-      await markFalsePositive(alertId, isFalsePositive)
+      const res = await markFalsePositive(alertId, isFalsePositive)
+      const learn = res.data?.learnResult
+      if (learn && learn.learned && learn.thresholdsAdjusted) {
+        const lines = learn.reasons || ['阈值已自动调整']
+        alert(
+          (isFalsePositive ? '已标记为误报。' : '已取消误报标记。') +
+          '\n\n系统已根据新数据重新学习：\n' +
+          lines.slice(0, 5).join('\n')
+        )
+      } else if (learn && learn.learned) {
+        alert(
+          (isFalsePositive ? '已标记为误报。' : '已取消误报标记。') +
+          '\n\n系统已重新学习，当前阈值在合理范围内无需调整。'
+        )
+      } else if (learn && !learn.learned) {
+        alert(
+          (isFalsePositive ? '已标记为误报。' : '已取消误报标记。') +
+          `\n\n（暂未触发学习：${learn.reason || '数据不足'}）`
+        )
+      }
       loadData()
     } catch (err) {
       alert('操作失败: ' + err.message)

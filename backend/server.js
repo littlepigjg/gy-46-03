@@ -215,8 +215,24 @@ app.put('/api/alerts/:id/false-positive', async (req, res) => {
   const { id } = req.params;
   const { is_false_positive = true } = req.body;
   try {
-    const alert = await markFalsePositive(parseInt(id), is_false_positive);
-    res.json(alert);
+    const result = await markFalsePositive(parseInt(id), is_false_positive);
+    const { alert, shouldRelearn } = result;
+
+    let learnResult = null;
+    if (shouldRelearn && alert && alert.url_id) {
+      try {
+        learnResult = await learnThresholdIfNeeded(alert.url_id, {
+          falsePositiveMarked: true
+        });
+      } catch (learnErr) {
+        console.error('[API] 标记误报后学习失败:', learnErr.message);
+      }
+    }
+
+    res.json({
+      ...alert,
+      learnResult
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -256,7 +272,7 @@ app.post('/api/urls/:id/reset-learning', async (req, res) => {
 app.post('/api/urls/:id/trigger-learning', async (req, res) => {
   const { id } = req.params;
   try {
-    const result = await learnThresholdIfNeeded(parseInt(id));
+    const result = await learnThresholdIfNeeded(parseInt(id), { forceTrigger: true });
     res.json(result);
   } catch (err) {
     res.status(500).json({ error: err.message });

@@ -1,14 +1,30 @@
 import getDb from './db.js';
+import { dispatchNotifications } from './notificationService.js';
 
 function ensureAlertRule(db, urlId) {
   let rule = db.prepare('SELECT * FROM alert_rules WHERE url_id = ?').get(urlId);
   if (!rule) {
-    db.prepare(`
-      INSERT INTO alert_rules (url_id) VALUES (?)
-    `).run(urlId);
+    db.prepare('INSERT INTO alert_rules (url_id) VALUES (?)').run(urlId);
     rule = db.prepare('SELECT * FROM alert_rules WHERE url_id = ?').get(urlId);
   }
   return rule;
+}
+
+function recordDiffHistory(db, urlId, previousScreenshot, currentScreenshot, diffResult) {
+  db.prepare(`
+    INSERT INTO diff_history (
+      url_id, screenshot_before_id, screenshot_after_id,
+      overall_score, layout_score, content_score, style_score
+    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    urlId,
+    previousScreenshot?.id || null,
+    currentScreenshot.id,
+    diffResult.scores.overall,
+    diffResult.scores.layout,
+    diffResult.scores.content,
+    diffResult.scores.style
+  );
 }
 
 function checkCooldown(db, urlId, cooldownMinutes) {
@@ -27,96 +43,19 @@ function checkCooldown(db, urlId, cooldownMinutes) {
   return (now - lastAlertTime) >= cooldownMs;
 }
 
-function sendInAppNotification(db, alert, urlRecord) {
-  try {
-    db.prepare(`
-      INSERT INTO notifications (alert_id, channel, status)
-      VALUES (?, 'in_app', 'sent')
-    `).run(alert.id);
-    console.log(`[告警] 站内通知已创建: ${urlRecord.name} - ${alert.id}`);
-    return { success: true, channel: 'in_app' };
-  } catch (err) {
-    console.error('[告警] 站内通知失败:', err.message);
-    db.prepare(`
-      INSERT INTO notifications (alert_id, channel, status, error_message)
-      VALUES (?, 'in_app', 'failed', ?)
-    `).run(alert.id, err.message);
-    return { success: false, channel: 'in_app', error: err.message };
-  }
-}
-
-function sendEmailNotification(db, alert, urlRecord, emailAddress) {
-  if (!emailAddress) {
-    return { success: false, channel: 'email', error: '未配置邮箱地址' };
-  }
-
-  try {
-    const changeDescriptions = (JSON.parse(alert.change_types || '[]'))
-      .map(c => `${c.description}(${Math.round(c.severity * 100)}%)`)
-      .join(', ') || '未检测到具体变化类型';
-
-    const subject = `[网页监控告警] ${urlRecord.name} 检测到页面变化`;
-    const body = `
-监控页面: ${urlRecord.name}
-URL: ${urlRecord.url}
-告警时间: ${new Date().toLocaleString('zh-CN')}
-
-变化类型: ${changeDescriptions}
-总体差异度: ${Math.round(alert.overall_score * 100)}%
-  - 布局变化: ${Math.round(alert.layout_score * 100)}%
-  - 内容变化: ${Math.round(alert.content_score * 100)}%
-  - 样式变化: ${Math.round(alert.style_score * 100)}%
-
-请登录系统查看详细对比截图。
-
----
-网页截图归档工具自动发送
-    `.trim();
-
-    console.log(`[告警] 邮件通知 (模拟): To=${emailAddress}, Subject=${subject}`);
-    console.log(`[告警] 邮件内容摘要: ${body.substring(0, 200)}...`);
-
-    db.prepare(`
-      INSERT INTO notifications (alert_id, channel, status)
-      VALUES (?, 'email', 'sent')
-    `).run(alert.id);
-
-    return { success: true, channel: 'email' };
-  } catch (err) {
-    console.error('[告警] 邮件通知失败:', err.message);
-    db.prepare(`
-      INSERT INTO notifications (alert_id, channel, status, error_message)
-      VALUES (?, 'email', 'failed', ?)
-    `).run(alert.id, err.message);
-    return { success: false, channel: 'email', error: err.message };
-  }
-}
-
 export async function processAlert(urlRecord, previousScreenshot, currentScreenshot, diffResult) {
   const db = await getDb();
   const urlId = urlRecord.id;
 
   const rule = ensureAlertRule(db, urlId);
 
+  recordDiffHistory(db, urlId, previousScreenshot, currentScreenshot, diffResult);
+
   if (!rule.enabled) {
     return { alertCreated: false, reason: 'alert_rule_disabled' };
   }
 
   if (!diffResult.shouldAlert) {
-    db.prepare(`
-      INSERT INTO diff_history (
-        url_id, screenshot_before_id, screenshot_after_id,
-        overall_score, layout_score, content_score, style_score
-      ) VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      urlId,
-      previousScreenshot?.id || null,
-      currentScreenshot.id,
-      diffResult.scores.overall,
-      diffResult.scores.layout,
-      diffResult.scores.content,
-      diffResult.scores.style
-    );
     return { alertCreated: false, reason: 'below_threshold' };
   }
 
@@ -148,34 +87,16 @@ export async function processAlert(urlRecord, previousScreenshot, currentScreens
 
   const alertId = insertResult.lastInsertRowid;
 
-  db.prepare(`
-    INSERT INTO diff_history (
-      url_id, screenshot_before_id, screenshot_after_id,
-      overall_score, layout_score, content_score, style_score
-    ) VALUES (?, ?, ?, ?, ?, ?, ?)
-  `).run(
-    urlId,
-    previousScreenshot?.id || null,
-    currentScreenshot.id,
-    diffResult.scores.overall,
-    diffResult.scores.layout,
-    diffResult.scores.content,
-    diffResult.scores.style
-  );
+  const alertRecordForNotify = {
+    id: alertId,
+    change_types: changeTypesJson,
+    overall_score: diffResult.scores.overall,
+    layout_score: diffResult.scores.layout,
+    content_score: diffResult.scores.content,
+    style_score: diffResult.scores.style
+  };
 
-  const channelsNotified = [];
-
-  if (rule.notify_in_app) {
-    const alertRecord = { id: alertId, change_types: changeTypesJson, overall_score: diffResult.scores.overall, layout_score: diffResult.scores.layout, content_score: diffResult.scores.content, style_score: diffResult.scores.style };
-    const result = sendInAppNotification(db, alertRecord, urlRecord);
-    if (result.success) channelsNotified.push('in_app');
-  }
-
-  if (rule.notify_email) {
-    const alertRecord = { id: alertId, change_types: changeTypesJson, overall_score: diffResult.scores.overall, layout_score: diffResult.scores.layout, content_score: diffResult.scores.content, style_score: diffResult.scores.style };
-    const result = sendEmailNotification(db, alertRecord, urlRecord, rule.email_address);
-    if (result.success) channelsNotified.push('email');
-  }
+  const channelsNotified = dispatchNotifications(db, alertRecordForNotify, urlRecord, rule);
 
   if (channelsNotified.length > 0) {
     db.prepare(`
@@ -262,15 +183,9 @@ export async function getAlerts(urlId = null, options = {}) {
 
   const alerts = db.prepare(sql).all(...params);
   return alerts.map(a => {
-    try {
-      a.change_types = JSON.parse(a.change_types || '[]');
-    } catch { a.change_types = []; }
-    try {
-      a.diff_regions = JSON.parse(a.diff_regions || '[]');
-    } catch { a.diff_regions = []; }
-    try {
-      a.notification_channels = JSON.parse(a.notification_channels || '[]');
-    } catch { a.notification_channels = []; }
+    try { a.change_types = JSON.parse(a.change_types || '[]'); } catch { a.change_types = []; }
+    try { a.diff_regions = JSON.parse(a.diff_regions || '[]'); } catch { a.diff_regions = []; }
+    try { a.notification_channels = JSON.parse(a.notification_channels || '[]'); } catch { a.notification_channels = []; }
     return a;
   });
 }
@@ -305,7 +220,11 @@ export async function markFalsePositive(alertId, isFalsePositive = true) {
   const db = await getDb();
   db.prepare('UPDATE alerts SET is_false_positive = ? WHERE id = ?')
     .run(isFalsePositive ? 1 : 0, alertId);
-  return db.prepare('SELECT * FROM alerts WHERE id = ?').get(alertId);
+  const alert = db.prepare('SELECT * FROM alerts WHERE id = ?').get(alertId);
+  return {
+    alert,
+    shouldRelearn: true
+  };
 }
 
 export async function getDiffHistory(urlId, limit = 30) {
@@ -322,6 +241,16 @@ export async function getDiffHistory(urlId, limit = 30) {
   return history;
 }
 
+export function getAlertWithScreenshots(db, alertId) {
+  return db.prepare(`
+    SELECT a.*, sb.file_path as before_file_path, sa.file_path as after_file_path
+    FROM alerts a
+    LEFT JOIN screenshots sb ON a.screenshot_before_id = sb.id
+    LEFT JOIN screenshots sa ON a.screenshot_after_id = sa.id
+    WHERE a.id = ?
+  `).get(alertId);
+}
+
 export default {
   processAlert,
   getAlertRule,
@@ -329,5 +258,6 @@ export default {
   getAlerts,
   getAlertStats,
   markFalsePositive,
-  getDiffHistory
+  getDiffHistory,
+  getAlertWithScreenshots
 };
