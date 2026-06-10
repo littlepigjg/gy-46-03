@@ -5,6 +5,16 @@ import { fileURLToPath } from 'url';
 import fs from 'fs';
 import getDb from './db.js';
 import { startScheduler, triggerScreenshotNow } from './scheduler.js';
+import {
+  getAlertRule,
+  updateAlertRule,
+  getAlerts,
+  getAlertStats,
+  markFalsePositive,
+  getDiffHistory
+} from './alertService.js';
+import { getThresholdStats, resetLearning, learnThresholdIfNeeded } from './thresholdLearner.js';
+import { compareImages } from './imageDiff.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -154,6 +164,116 @@ app.get('/api/urls/:id', async (req, res) => {
     return res.status(404).json({ error: 'URL不存在' });
   }
   res.json(url);
+});
+
+app.get('/api/urls/:id/alert-rule', async (req, res) => {
+  const { id } = req.params;
+  try {
+    const rule = await getAlertRule(parseInt(id));
+    res.json(rule);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.put('/api/urls/:id/alert-rule', async (req, res) => {
+  const { id } = req.params;
+  try {
+    const rule = await updateAlertRule(parseInt(id), req.body);
+    res.json(rule);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/alerts', async (req, res) => {
+  try {
+    const { url_id, limit, offset, include_false_positive } = req.query;
+    const options = {
+      limit: limit ? parseInt(limit) : 50,
+      offset: offset ? parseInt(offset) : 0,
+      includeFalsePositive: include_false_positive !== 'false'
+    };
+    const alerts = await getAlerts(url_id ? parseInt(url_id) : null, options);
+    res.json(alerts);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/alerts/stats', async (req, res) => {
+  try {
+    const { url_id } = req.query;
+    const stats = await getAlertStats(url_id ? parseInt(url_id) : null);
+    res.json(stats);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.put('/api/alerts/:id/false-positive', async (req, res) => {
+  const { id } = req.params;
+  const { is_false_positive = true } = req.body;
+  try {
+    const alert = await markFalsePositive(parseInt(id), is_false_positive);
+    res.json(alert);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/urls/:id/diff-history', async (req, res) => {
+  const { id } = req.params;
+  try {
+    const { limit } = req.query;
+    const history = await getDiffHistory(parseInt(id), limit ? parseInt(limit) : 30);
+    res.json(history);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/urls/:id/threshold-stats', async (req, res) => {
+  const { id } = req.params;
+  try {
+    const stats = await getThresholdStats(parseInt(id));
+    res.json(stats);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/urls/:id/reset-learning', async (req, res) => {
+  const { id } = req.params;
+  try {
+    const stats = await resetLearning(parseInt(id));
+    res.json(stats);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/urls/:id/trigger-learning', async (req, res) => {
+  const { id } = req.params;
+  try {
+    const result = await learnThresholdIfNeeded(parseInt(id));
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/compare-images', async (req, res) => {
+  const { image1_path, image2_path, thresholds } = req.body;
+  if (!image1_path || !image2_path) {
+    return res.status(400).json({ error: '需要提供两张图片路径' });
+  }
+  try {
+    const result = await compareImages(image1_path, image2_path, thresholds);
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.listen(PORT, async () => {

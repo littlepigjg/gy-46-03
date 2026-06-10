@@ -46,8 +46,8 @@ function wrapStatement(stmt, db) {
 async function initDb() {
   const SQL = await initSqlJs({
     locateFile: (file) => {
-      const modPath = path.dirname(new URL(import.meta.resolve('sql.js')).pathname.replace(/^\/([A-Z]:)/, '$1'));
-      return path.join(modPath, file);
+      const currentDir = decodeURIComponent(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Z]:)/, '$1')));
+      return path.join(currentDir, 'node_modules', 'sql.js', 'dist', file);
     }
   });
 
@@ -83,6 +83,93 @@ async function initDb() {
 
     CREATE INDEX IF NOT EXISTS idx_screenshots_url_id ON screenshots(url_id);
     CREATE INDEX IF NOT EXISTS idx_screenshots_created_at ON screenshots(created_at);
+
+    CREATE TABLE IF NOT EXISTS alert_rules (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      url_id INTEGER NOT NULL UNIQUE,
+      enabled INTEGER NOT NULL DEFAULT 1,
+      overall_threshold REAL NOT NULL DEFAULT 0.05,
+      layout_threshold REAL NOT NULL DEFAULT 0.10,
+      content_threshold REAL NOT NULL DEFAULT 0.05,
+      style_threshold REAL NOT NULL DEFAULT 0.08,
+      notify_in_app INTEGER NOT NULL DEFAULT 1,
+      notify_email INTEGER NOT NULL DEFAULT 0,
+      email_address TEXT,
+      cooldown_minutes INTEGER NOT NULL DEFAULT 60,
+      auto_learn INTEGER NOT NULL DEFAULT 1,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (url_id) REFERENCES urls(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS alerts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      url_id INTEGER NOT NULL,
+      screenshot_before_id INTEGER,
+      screenshot_after_id INTEGER NOT NULL,
+      overall_score REAL NOT NULL,
+      layout_score REAL NOT NULL,
+      content_score REAL NOT NULL,
+      style_score REAL NOT NULL,
+      change_types TEXT NOT NULL,
+      diff_regions TEXT,
+      is_false_positive INTEGER NOT NULL DEFAULT 0,
+      notified INTEGER NOT NULL DEFAULT 0,
+      notification_channels TEXT,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (url_id) REFERENCES urls(id) ON DELETE CASCADE,
+      FOREIGN KEY (screenshot_before_id) REFERENCES screenshots(id) ON DELETE SET NULL,
+      FOREIGN KEY (screenshot_after_id) REFERENCES screenshots(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_alerts_url_id ON alerts(url_id);
+    CREATE INDEX IF NOT EXISTS idx_alerts_created_at ON alerts(created_at);
+    CREATE INDEX IF NOT EXISTS idx_alerts_false_positive ON alerts(is_false_positive);
+
+    CREATE TABLE IF NOT EXISTS diff_history (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      url_id INTEGER NOT NULL,
+      screenshot_before_id INTEGER,
+      screenshot_after_id INTEGER NOT NULL,
+      overall_score REAL NOT NULL,
+      layout_score REAL NOT NULL,
+      content_score REAL NOT NULL,
+      style_score REAL NOT NULL,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (url_id) REFERENCES urls(id) ON DELETE CASCADE,
+      FOREIGN KEY (screenshot_before_id) REFERENCES screenshots(id) ON DELETE SET NULL,
+      FOREIGN KEY (screenshot_after_id) REFERENCES screenshots(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_diff_history_url_id ON diff_history(url_id);
+    CREATE INDEX IF NOT EXISTS idx_diff_history_created_at ON diff_history(created_at);
+
+    CREATE TABLE IF NOT EXISTS threshold_stats (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      url_id INTEGER NOT NULL UNIQUE,
+      total_comparisons INTEGER NOT NULL DEFAULT 0,
+      alert_count INTEGER NOT NULL DEFAULT 0,
+      false_positive_count INTEGER NOT NULL DEFAULT 0,
+      avg_overall_score REAL NOT NULL DEFAULT 0,
+      avg_layout_score REAL NOT NULL DEFAULT 0,
+      avg_content_score REAL NOT NULL DEFAULT 0,
+      avg_style_score REAL NOT NULL DEFAULT 0,
+      std_overall_score REAL NOT NULL DEFAULT 0,
+      last_learned_at DATETIME,
+      FOREIGN KEY (url_id) REFERENCES urls(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS notifications (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      alert_id INTEGER NOT NULL,
+      channel TEXT NOT NULL,
+      status TEXT NOT NULL,
+      error_message TEXT,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (alert_id) REFERENCES alerts(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_notifications_alert_id ON notifications(alert_id);
   `);
 
   const wrappedDb = {
