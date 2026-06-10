@@ -1,10 +1,7 @@
 import getDb from './db.js';
 import {
   aggregateDimensionStats,
-  computeAlertMetrics,
-  buildScoreStats,
-  calculateMean,
-  calculateStdDev
+  computeAlertMetrics
 } from './statsCalculator.js';
 import {
   adjustAllThresholds,
@@ -12,7 +9,8 @@ import {
 } from './thresholdStrategy.js';
 
 const LEARNING_INTERVAL_COMPARISONS = 15;
-const MAX_HISTORY_SAMPLES = 200;
+const MAX_HISTORY_SAMPLES = 300;
+const MIN_FP_MARKED_SAMPLES = 3;
 
 function ensureThresholdStats(db, urlId) {
   let stats = db.prepare('SELECT * FROM threshold_stats WHERE url_id = ?').get(urlId);
@@ -50,27 +48,50 @@ function fetchLearningData(db, urlId) {
 }
 
 function shouldLearnByInterval(db, urlId, forceTrigger, hasFalsePositiveMarked) {
-  if (forceTrigger || hasFalsePositiveMarked) return true;
+  if (forceTrigger) return { ok: true, reason: 'force_trigger' };
+  if (hasFalsePositiveMarked) return { ok: true, reason: 'false_positive_marked' };
 
   const stats = ensureThresholdStats(db, urlId);
   if (stats.total_comparisons < LEARNING_CONFIG.MIN_HISTORY_FOR_ADJUSTMENT) {
-    return false;
+    return { ok: false, reason: `too_few_comparisons (${stats.total_comparisons}/${LEARNING_CONFIG.MIN_HISTORY_FOR_ADJUSTMENT})` };
   }
 
-  if (!stats.last_learned_at) return true;
+  if (!stats.last_learned_at) return { ok: true, reason: 'never_learned' };
 
   const recentComparisons = db.prepare(`
     SELECT COUNT(*) as cnt FROM diff_history
     WHERE url_id = ? AND created_at > ?
   `).get(urlId, stats.last_learned_at);
 
-  return (recentComparisons.cnt || 0) >= LEARNING_INTERVAL_COMPARISONS;
+  if ((recentComparisons.cnt || 0) >= LEARNING_INTERVAL_COMPARISONS) {
+    return { ok: true, reason: 'interval_reached' };
+  }
+
+  return { ok: false, reason: `interval_not_reached (${recentComparisons.cnt || 0}/${LEARNING_INTERVAL_COMPARISONS})` };
 }
 
 function updateThresholdStats(db, urlId, { history, realAlerts, falsePositiveAlerts, dimStats }) {
   const overallScores = history.map(h => h.overall_score);
-  const avgOverall = calculateMean(overallScores);
-  const stdOverall = calculateStdDev(overallScores, avgOverall);
+  const layoutScores = history.map(h => h.layout_score);
+  const contentScores = history.map(h => h.content_score);
+  const styleScores = history.map(h => h.style_score);
+
+  const avgOverall = overallScores.length > 0
+    ? overallScores.reduce((a, b) => a + b, 0) / overallScores.length
+    : 0;
+  const avgLayout = layoutScores.length > 0
+    ? layoutScores.reduce((a, b) => a + b, 0) / layoutScores.length
+    : 0;
+  const avgContent = contentScores.length > 0
+    ? contentScores.reduce((a, b) => a + b, 0) / contentScores.length
+    : 0;
+  const avgStyle = styleScores.length > 0
+    ? styleScores.reduce((a, b) => a + b, 0) / styleScores.length
+    : 0;
+
+  const stdOverall = overallScores.length > 0
+    ? Math.sqrt(overallScores.reduce((s, v) => s + Math.pow(v - avgOverall, 2), 0) / overallScores.length)
+    : 0;
 
   db.prepare(`
     UPDATE threshold_stats SET
@@ -89,9 +110,9 @@ function updateThresholdStats(db, urlId, { history, realAlerts, falsePositiveAle
     realAlerts.length,
     falsePositiveAlerts.length,
     avgOverall,
-    dimStats.layout.mean,
-    dimStats.content.mean,
-    dimStats.style.mean,
+    avgLayout,
+    avgContent,
+    avgStyle,
     stdOverall,
     urlId
   );
@@ -125,21 +146,27 @@ export async function learnThresholdIfNeeded(urlId, options = {}) {
     return { learned: false, reason: 'no_alert_rule' };
   }
 
-  if (!rule.auto_learn && !forceTrigger) {
+  if (!rule.auto_learn && !forceTrigger && !falsePositiveMarked) {
     return { learned: false, reason: 'auto_learn_disabled' };
   }
 
-  if (!shouldLearnByInterval(db, urlId, forceTrigger, falsePositiveMarked)) {
-    return { learned: false, reason: 'not_enough_data_or_interval' };
+  const intervalCheck = shouldLearnByInterval(db, urlId, forceTrigger, falsePositiveMarked);
+  if (!intervalCheck.ok) {
+    return { learned: false, reason: intervalCheck.reason, trigger: intervalCheck };
   }
 
   const { history, realAlerts, falsePositiveAlerts, truePositiveAlerts } =
     fetchLearningData(db, urlId);
 
-  if (history.length < LEARNING_CONFIG.MIN_HISTORY_FOR_ADJUSTMENT) {
+  const minSamples = falsePositiveMarked
+    ? MIN_FP_MARKED_SAMPLES
+    : LEARNING_CONFIG.MIN_HISTORY_FOR_ADJUSTMENT;
+
+  if (history.length < minSamples) {
     return {
       learned: false,
-      reason: `insufficient_history (${history.length}/${LEARNING_CONFIG.MIN_HISTORY_FOR_ADJUSTMENT})`
+      reason: `insufficient_history (${history.length}/${minSamples}, fpMarked=${falsePositiveMarked})`,
+      trigger: intervalCheck
     };
   }
 
@@ -200,7 +227,10 @@ export async function learnThresholdIfNeeded(urlId, options = {}) {
       thresholdsAdjusted: false,
       metrics,
       stats: dimStats,
-      reason: 'within_target_range'
+      reasons: adjustResult.reasons,
+      warnings: adjustResult.warnings,
+      trigger: intervalCheck,
+      debug: adjustResult
     };
   }
 
@@ -210,10 +240,12 @@ export async function learnThresholdIfNeeded(urlId, options = {}) {
     learned: true,
     thresholdsAdjusted: true,
     reasons: adjustResult.reasons,
+    warnings: adjustResult.warnings,
     oldThresholds: currentThresholds,
     newThresholds: adjustResult.thresholds,
     metrics,
-    stats: dimStats
+    stats: dimStats,
+    trigger: intervalCheck
   };
 }
 
@@ -245,5 +277,6 @@ export default {
   getThresholdStats,
   resetLearning,
   LEARNING_CONFIG,
-  LEARNING_INTERVAL_COMPARISONS
+  LEARNING_INTERVAL_COMPARISONS,
+  MIN_FP_MARKED_SAMPLES
 };

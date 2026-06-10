@@ -25,9 +25,19 @@ export function calculateMedian(values) {
   return calculatePercentile(sorted, 0.5);
 }
 
+export function calculateWeightedMean(values, weights) {
+  if (values.length === 0) return 0;
+  const effectiveWeights = weights && weights.length === values.length
+    ? weights
+    : values.map((_, i) => Math.pow(0.95, values.length - 1 - i));
+  const totalWeight = effectiveWeights.reduce((a, b) => a + b, 0);
+  if (totalWeight === 0) return calculateMean(values);
+  return values.reduce((sum, v, i) => sum + v * effectiveWeights[i], 0) / totalWeight;
+}
+
 export function buildScoreStats(values) {
   if (values.length === 0) {
-    return { mean: 0, stdDev: 0, median: 0, p90: 0, p95: 0, max: 0, min: 0 };
+    return { mean: 0, stdDev: 0, median: 0, p75: 0, p85: 0, p90: 0, p95: 0, max: 0, min: 0, count: 0 };
   }
   const sorted = [...values].sort((a, b) => a - b);
   const mean = calculateMean(values);
@@ -35,10 +45,13 @@ export function buildScoreStats(values) {
     mean,
     stdDev: calculateStdDev(values, mean),
     median: calculatePercentile(sorted, 0.5),
-    p90: calculatePercentile(sorted, 0.9),
+    p75: calculatePercentile(sorted, 0.75),
+    p85: calculatePercentile(sorted, 0.85),
+    p90: calculatePercentile(sorted, 0.90),
     p95: calculatePercentile(sorted, 0.95),
     max: sorted[sorted.length - 1],
-    min: sorted[0]
+    min: sorted[0],
+    count: values.length
   };
 }
 
@@ -57,18 +70,36 @@ export function aggregateDimensionStats(historyRecords) {
   };
 }
 
+export function calculateTheoreticalAlertRate(allScores, threshold) {
+  if (allScores.length === 0) return 0;
+  const alertCount = allScores.filter(s => s > threshold).length;
+  return alertCount / allScores.length;
+}
+
+export function backtestThreshold(allScores, truePositiveScores, falsePositiveScores, threshold) {
+  const theoreticalRate = calculateTheoreticalAlertRate(allScores, threshold);
+  const capturedTP = truePositiveScores.filter(s => s > threshold).length;
+  const capturedFP = falsePositiveScores.filter(s => s > threshold).length;
+  const totalAlerts = allScores.filter(s => s > threshold).length;
+  const precision = totalAlerts > 0 ? (capturedTP) / totalAlerts : 0;
+  const recall = truePositiveScores.length > 0 ? capturedTP / truePositiveScores.length : 0;
+  return {
+    theoreticalAlertRate: theoreticalRate,
+    capturedTruePositives: capturedTP,
+    capturedFalsePositives: capturedFP,
+    precision,
+    recall,
+    f1: precision + recall > 0 ? 2 * precision * recall / (precision + recall) : 0
+  };
+}
+
 export function computeAlertMetrics({
   allHistory,
   realAlerts,
   falsePositiveAlerts,
   rule
 }) {
-  const alertIdsFromReal = new Set(realAlerts.map(a => a.id));
-
-  const falsePositiveIds = new Set(
-    falsePositiveAlerts.map(a => a.id)
-  );
-
+  const totalComparisons = allHistory.length;
   const totalRealAlertCount = realAlerts.length;
   const falsePositiveCount = falsePositiveAlerts.length;
   const truePositiveCount = totalRealAlertCount - falsePositiveCount;
@@ -77,8 +108,14 @@ export function computeAlertMetrics({
     ? falsePositiveCount / totalRealAlertCount
     : 0;
 
-  const totalComparisons = allHistory.length;
-  const alertRate = totalComparisons > 0 ? totalRealAlertCount / totalComparisons : 0;
+  const realAlertRate = totalComparisons > 0 ? totalRealAlertCount / totalComparisons : 0;
+
+  const theoreticalAlertRate = rule && totalComparisons > 0
+    ? calculateTheoreticalAlertRate(
+        allHistory.map(h => h.overall_score),
+        rule.overall_threshold
+      )
+    : realAlertRate;
 
   return {
     totalComparisons,
@@ -86,7 +123,9 @@ export function computeAlertMetrics({
     falsePositiveCount,
     truePositiveCount,
     falsePositiveRate,
-    alertRate
+    realAlertRate,
+    theoreticalAlertRate,
+    effectiveAlertRate: Math.max(realAlertRate, theoreticalAlertRate)
   };
 }
 
@@ -113,8 +152,11 @@ export default {
   calculateStdDev,
   calculatePercentile,
   calculateMedian,
+  calculateWeightedMean,
   buildScoreStats,
   aggregateDimensionStats,
+  calculateTheoreticalAlertRate,
+  backtestThreshold,
   computeAlertMetrics,
   getFalsePositiveScoresByDimension,
   calculateScoresByDimension
