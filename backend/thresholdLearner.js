@@ -70,7 +70,7 @@ function shouldLearnByInterval(db, urlId, forceTrigger, hasFalsePositiveMarked) 
   return { ok: false, reason: `interval_not_reached (${recentComparisons.cnt || 0}/${LEARNING_INTERVAL_COMPARISONS})` };
 }
 
-function updateThresholdStats(db, urlId, { history, realAlerts, falsePositiveAlerts, dimStats }) {
+function updateThresholdStats(db, urlId, { history, realAlerts, falsePositiveAlerts, dimStats, updateLastLearnedAt = true }) {
   const overallScores = history.map(h => h.overall_score);
   const layoutScores = history.map(h => h.layout_score);
   const contentScores = history.map(h => h.content_score);
@@ -93,29 +93,54 @@ function updateThresholdStats(db, urlId, { history, realAlerts, falsePositiveAle
     ? Math.sqrt(overallScores.reduce((s, v) => s + Math.pow(v - avgOverall, 2), 0) / overallScores.length)
     : 0;
 
-  db.prepare(`
-    UPDATE threshold_stats SET
-      total_comparisons = ?,
-      alert_count = ?,
-      false_positive_count = ?,
-      avg_overall_score = ?,
-      avg_layout_score = ?,
-      avg_content_score = ?,
-      avg_style_score = ?,
-      std_overall_score = ?,
-      last_learned_at = CURRENT_TIMESTAMP
-    WHERE url_id = ?
-  `).run(
-    history.length,
-    realAlerts.length,
-    falsePositiveAlerts.length,
-    avgOverall,
-    avgLayout,
-    avgContent,
-    avgStyle,
-    stdOverall,
-    urlId
-  );
+  if (updateLastLearnedAt) {
+    db.prepare(`
+      UPDATE threshold_stats SET
+        total_comparisons = ?,
+        alert_count = ?,
+        false_positive_count = ?,
+        avg_overall_score = ?,
+        avg_layout_score = ?,
+        avg_content_score = ?,
+        avg_style_score = ?,
+        std_overall_score = ?,
+        last_learned_at = CURRENT_TIMESTAMP
+      WHERE url_id = ?
+    `).run(
+      history.length,
+      realAlerts.length,
+      falsePositiveAlerts.length,
+      avgOverall,
+      avgLayout,
+      avgContent,
+      avgStyle,
+      stdOverall,
+      urlId
+    );
+  } else {
+    db.prepare(`
+      UPDATE threshold_stats SET
+        total_comparisons = ?,
+        alert_count = ?,
+        false_positive_count = ?,
+        avg_overall_score = ?,
+        avg_layout_score = ?,
+        avg_content_score = ?,
+        avg_style_score = ?,
+        std_overall_score = ?
+      WHERE url_id = ?
+    `).run(
+      history.length,
+      realAlerts.length,
+      falsePositiveAlerts.length,
+      avgOverall,
+      avgLayout,
+      avgContent,
+      avgStyle,
+      stdOverall,
+      urlId
+    );
+  }
 }
 
 function applyThresholdsToDb(db, urlId, newThresholds) {
@@ -218,7 +243,8 @@ export async function learnThresholdIfNeeded(urlId, options = {}) {
     history,
     realAlerts,
     falsePositiveAlerts,
-    dimStats
+    dimStats,
+    updateLastLearnedAt: !falsePositiveMarked
   });
 
   if (!adjustResult.adjusted) {

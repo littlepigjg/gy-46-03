@@ -116,15 +116,14 @@ export function adjustSingleDimension({
 
   if (fpSuggestion) {
     if (fpSuggestion.value > candidate) {
-      const old = candidate;
       candidate = Math.max(candidate, fpSuggestion.value);
       reasons.push(`${dimension}维：基于${falsePositiveScores.length}次误报(${fpSuggestion.source})，需要提高`);
       if (fpSuggestion.confidence === 'weak') {
         warnings.push(`${dimension}维：误报样本少(${falsePositiveScores.length})，建议继续观察`);
       }
-    } else if (fpRate > TARGET_FALSE_POSITIVE_RATE_MAX && fpSuggestion.value > candidate * 0.9) {
+    } else if (fpRate > TARGET_FALSE_POSITIVE_RATE_MAX) {
       candidate = Math.max(candidate, fpSuggestion.value);
-      reasons.push(`${dimension}维：误报率${(fpRate * 100).toFixed(0)}%超标，即使误报分数偏低也采用建议值`);
+      reasons.push(`${dimension}维：误报率${(fpRate * 100).toFixed(0)}%超标，采用误报分布建议值(${fpSuggestion.source})`);
     }
   }
 
@@ -134,12 +133,28 @@ export function adjustSingleDimension({
       const suggestedFromAlerts = alertStats.p75 + SAFETY_MARGIN_BASE * 2;
       if (suggestedFromAlerts > candidate) {
         candidate = Math.max(candidate, suggestedFromAlerts);
-        reasons.push(`${dimension}维：误报率过高，基于告警分布P75提升`);
+        reasons.push(`${dimension}维：误报率过高，基于真实告警分布P75提升`);
       }
-    } else if (allSuggestion && allSuggestion.value > candidate) {
-      candidate = Math.max(candidate, allSuggestion.value);
-      reasons.push(`${dimension}维：误报率过高，基于全体分布P90提升`);
     }
+    if (fpRate > 0.30 && falsePositiveScores.length >= 2) {
+      const allAlertScores = [...realAlertScores, ...falsePositiveScores];
+      if (allAlertScores.length >= 3) {
+        const combinedStats = buildScoreStats(allAlertScores);
+        const safetyBoost = combinedStats.p80 + SAFETY_MARGIN_BASE * 3;
+        if (safetyBoost > candidate) {
+          candidate = Math.max(candidate, safetyBoost);
+          reasons.push(`${dimension}维：误报率>30%，基于告警+误报合并分布P80大幅提升`);
+        }
+      }
+    }
+    if (!fpSuggestion && allSuggestion && allSuggestion.value > candidate) {
+      candidate = Math.max(candidate, allSuggestion.value);
+      reasons.push(`${dimension}维：误报率过高，基于全体变化分布P90提升`);
+    }
+  }
+
+  if (fpRate <= TARGET_FALSE_POSITIVE_RATE_MAX && fpSuggestion && fpSuggestion.value <= candidate) {
+    warnings.push(`${dimension}维：误报分数(${fpSuggestion.value.toFixed(3)})低于当前阈值(${candidate.toFixed(3)})，可能是其他维度触发告警，已按误报率综合判断`);
   }
 
   if (effectiveAlertRate > TARGET_ALERT_RATE_MAX) {

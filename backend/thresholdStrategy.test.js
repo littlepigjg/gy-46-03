@@ -6,6 +6,7 @@ import {
   shouldTriggerLearning,
   LEARNING_CONFIG
 } from './thresholdStrategy.js';
+import { computeAlertMetrics } from './statsCalculator.js';
 
 function buildMetrics(overrides = {}) {
   return {
@@ -335,6 +336,114 @@ test('调整后的阈值不低于误报分数', () => {
     assert.ok(result.threshold >= minFp - 0.005,
       `调整后阈值${result.threshold}不应明显低于最低误报分数${minFp}`);
   }
+});
+
+test('误报分数远低于当前阈值但误报率>30%时依然提高阈值（核心Bug修复）', () => {
+  const currentT = 0.10;
+  const fpScores = [0.06, 0.055, 0.062, 0.058];
+
+  const result = adjustSingleDimension({
+    dimension: 'overall',
+    currentThreshold: currentT,
+    falsePositiveScores: fpScores,
+    allScores: buildHistoryScores(0.05, 40, 0.015),
+    realAlertScores: [0.12, 0.13, 0.115],
+    metrics: buildMetrics({
+      effectiveAlertRate: 0.08,
+      falsePositiveRate: 0.57,
+      totalRealAlertCount: 3,
+      totalFalsePositiveCount: 4
+    })
+  });
+
+  assert.equal(result.adjusted, true,
+    `误报率57%时必须调整，即使误报分数(${fpScores.join(',')})低于阈值${currentT}`);
+  assert.ok(result.threshold > currentT,
+    `阈值应从${currentT}提高，当前调整结果=${result.threshold}`);
+  assert.ok(result.reasons.some(r => r.includes('误报率') || r.includes('合并分布')),
+    `应有误报率相关的调整原因，实际: ${result.reasons.join('; ')}`);
+});
+
+test('误报分数低于阈值且误报率>15%时，取消fpSuggestion>阈值*0.9的严格限制', () => {
+  const currentT = 0.08;
+  const fpScores = [0.05, 0.052, 0.048];
+
+  const result = adjustSingleDimension({
+    dimension: 'overall',
+    currentThreshold: currentT,
+    falsePositiveScores: fpScores,
+    allScores: buildHistoryScores(0.04, 30, 0.01),
+    realAlertScores: [0.10, 0.11, 0.095],
+    metrics: buildMetrics({
+      effectiveAlertRate: 0.10,
+      falsePositiveRate: 0.50,
+      totalRealAlertCount: 3,
+      totalFalsePositiveCount: 3
+    })
+  });
+
+  assert.equal(result.adjusted, true,
+    `误报率50%，误报分数(${fpScores.join(',')})虽然远低于阈值${currentT}，但应触发调整`);
+});
+
+test('告警率虚高不会导致阈值无限制上升（effectiveAlertRate限制生效）', () => {
+  const currentT = 0.05;
+  const result1 = adjustSingleDimension({
+    dimension: 'overall',
+    currentThreshold: currentT,
+    falsePositiveScores: [],
+    allScores: buildHistoryScores(0.06, 50, 0.02),
+    realAlertScores: [0.08, 0.09, 0.085],
+    metrics: buildMetrics({
+      effectiveAlertRate: 0.15,
+      falsePositiveRate: 0.0,
+      totalRealAlertCount: 3
+    })
+  });
+
+  const result2 = adjustSingleDimension({
+    dimension: 'overall',
+    currentThreshold: currentT,
+    falsePositiveScores: [],
+    allScores: buildHistoryScores(0.06, 50, 0.02),
+    realAlertScores: [0.08, 0.09, 0.085],
+    metrics: buildMetrics({
+      effectiveAlertRate: 0.95,
+      falsePositiveRate: 0.0,
+      totalRealAlertCount: 3
+    })
+  });
+
+  const diff = Math.abs((result1.threshold - currentT) - (result2.threshold - currentT));
+  assert.ok(diff < 0.02,
+    `effectiveAlertRate=15%和95%时的调整幅度差异不应过大(实际差异=${diff.toFixed(4)})，` +
+    `说明告警率虚高被限制了。阈值1=${result1.threshold}, 阈值2=${result2.threshold}`);
+});
+
+test('statsCalculator.effectiveAlertRate 计算合理，不会虚高', () => {
+  const fakeHistory = [];
+  for (let i = 0; i < 40; i++) {
+    fakeHistory.push({ overall_score: 0.06 + Math.random() * 0.02 });
+  }
+  const fakeAlerts = [
+    { overall_score: 0.08 },
+    { overall_score: 0.09 },
+    { overall_score: 0.085 }
+  ];
+  const metrics = computeAlertMetrics({
+    allHistory: fakeHistory,
+    realAlerts: fakeAlerts,
+    falsePositiveAlerts: [],
+    rule: { overall_threshold: 0.03 }
+  });
+
+  assert.ok(metrics.theoreticalAlertRate > 0.8,
+    `理论告警率应偏高（实际=${metrics.theoreticalAlertRate.toFixed(2)}）`);
+  assert.ok(metrics.effectiveAlertRate < 0.30,
+    `effectiveAlertRate 应被限制在30%以下（实际=${metrics.effectiveAlertRate.toFixed(3)}，` +
+    `cappedTheoretical=${metrics.cappedTheoreticalAlertRate?.toFixed(3)}）`);
+  assert.ok(metrics.effectiveAlertRate >= metrics.realAlertRate,
+    `effectiveAlertRate(${metrics.effectiveAlertRate.toFixed(3)})不应低于realAlertRate(${metrics.realAlertRate.toFixed(3)})`);
 });
 
 console.log('\n所有 thresholdStrategy 单元测试通过!');

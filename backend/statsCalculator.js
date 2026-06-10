@@ -93,6 +93,10 @@ export function backtestThreshold(allScores, truePositiveScores, falsePositiveSc
   };
 }
 
+const THEORETICAL_ALERT_RATE_CAP = 0.25;
+const THEORETICAL_TO_REAL_MAX_RATIO = 3;
+const REAL_ALERTS_FOR_CONFIDENCE = 5;
+
 export function computeAlertMetrics({
   allHistory,
   realAlerts,
@@ -117,6 +121,22 @@ export function computeAlertMetrics({
       )
     : realAlertRate;
 
+  const cappedTheoretical = Math.min(
+    theoreticalAlertRate,
+    THEORETICAL_ALERT_RATE_CAP,
+    realAlertRate > 0 ? realAlertRate * THEORETICAL_TO_REAL_MAX_RATIO : THEORETICAL_ALERT_RATE_CAP
+  );
+
+  let effectiveAlertRate;
+  if (totalRealAlertCount >= REAL_ALERTS_FOR_CONFIDENCE) {
+    effectiveAlertRate = Math.max(realAlertRate, cappedTheoretical * 0.6);
+  } else if (totalRealAlertCount > 0) {
+    effectiveAlertRate = (realAlertRate * totalRealAlertCount + cappedTheoretical * 0.5 * (REAL_ALERTS_FOR_CONFIDENCE - totalRealAlertCount)) / REAL_ALERTS_FOR_CONFIDENCE;
+    effectiveAlertRate = Math.max(effectiveAlertRate, realAlertRate);
+  } else {
+    effectiveAlertRate = cappedTheoretical * 0.5;
+  }
+
   return {
     totalComparisons,
     totalRealAlertCount,
@@ -125,7 +145,8 @@ export function computeAlertMetrics({
     falsePositiveRate,
     realAlertRate,
     theoreticalAlertRate,
-    effectiveAlertRate: Math.max(realAlertRate, theoreticalAlertRate)
+    cappedTheoreticalAlertRate: cappedTheoretical,
+    effectiveAlertRate
   };
 }
 

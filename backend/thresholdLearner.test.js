@@ -333,9 +333,9 @@ test('场景6: 应该误报标记时总是立即触发学习（shouldTriggerLear
   console.log('  场景6: 所有触发条件判定正确');
 });
 
-test('场景7: effectiveAlertRate 取理论值和真实值中较大者', () => {
-  const history = generateHistory(40, 0.05, 0.02);
-  const alerts = history.filter(h => h.overall_score > 0.07).map((h, i) => ({
+test('场景7: effectiveAlertRate 被合理限制，不会虚高', () => {
+  const history = generateHistory(40, 0.06, 0.015);
+  const alerts = history.filter(h => h.overall_score > 0.08).map((h, i) => ({
     id: i + 1,
     url_id: 1,
     overall_score: h.overall_score,
@@ -349,12 +349,122 @@ test('场景7: effectiveAlertRate 取理论值和真实值中较大者', () => {
   const rule = { overall_threshold: 0.03, layout_threshold: 0.025, content_threshold: 0.04, style_threshold: 0.02 };
   const metrics = computeAlertMetrics({ allHistory: history, realAlerts: alerts, falsePositiveAlerts: [], rule });
 
-  assert.ok(metrics.theoreticalAlertRate > metrics.realAlertRate,
-    `理论告警率(${metrics.theoreticalAlertRate.toFixed(3)})应高于实际告警率(${metrics.realAlertRate.toFixed(3)})，因为阈值低`);
-  assert.equal(metrics.effectiveAlertRate, metrics.theoreticalAlertRate,
-    'effectiveAlertRate应取较大值');
+  assert.ok(metrics.theoreticalAlertRate > 0.5,
+    `理论告警率应偏高（实际=${metrics.theoreticalAlertRate.toFixed(2)}，因为阈值太低）`);
+  assert.ok(metrics.cappedTheoreticalAlertRate <= 0.25,
+    `cappedTheoreticalAlertRate(${metrics.cappedTheoreticalAlertRate.toFixed(3)}不应超过25%`);
+  assert.ok(metrics.effectiveAlertRate <= 0.25,
+    `effectiveAlertRate(${metrics.effectiveAlertRate.toFixed(3)})不应超过25%，不会因为理论值虚高`);
+  assert.ok(metrics.effectiveAlertRate >= metrics.realAlertRate,
+    `effectiveAlertRate不应低于realAlertRate`);
 
-  console.log(`  场景7: real=${(metrics.realAlertRate * 100).toFixed(1)}%, theoretical=${(metrics.theoreticalAlertRate * 100).toFixed(1)}%, effective=${(metrics.effectiveAlertRate * 100).toFixed(1)}%`);
+  console.log(`  场景7: real=${(metrics.realAlertRate * 100).toFixed(1)}%, rawTheoretical=${(metrics.theoreticalAlertRate * 100).toFixed(1)}%, cappedTheoretical=${(metrics.cappedTheoreticalAlertRate * 100).toFixed(1)}%, effective=${(metrics.effectiveAlertRate * 100).toFixed(1)}%`);
+});
+
+test('场景8: 误报分数远低于阈值但误报率>50%时依然提高阈值', () => {
+  const history = generateHistory(60, 0.04, 0.012);
+  const tpScores = [0.12, 0.13, 0.115];
+  const fpScores = [0.06, 0.055, 0.062, 0.058];
+
+  const fpAlerts = fpScores.map((s, i) => ({
+    id: i + 1,
+    url_id: 1,
+    overall_score: s,
+    layout_score: s * 0.7,
+    content_score: s * 0.9,
+    style_score: s * 0.5,
+    is_false_positive: 1,
+    created_at: new Date(Date.now() - i * 3600000).toISOString()
+  }));
+  const tpAlerts = tpScores.map((s, i) => ({
+    id: 100 + i,
+    url_id: 1,
+    overall_score: s,
+    layout_score: s * 0.6,
+    content_score: s * 0.8,
+    style_score: s * 0.5,
+    is_false_positive: 0,
+    created_at: new Date(Date.now() - 50000 - i * 3600000).toISOString()
+  }));
+
+  const { result } = simulateFullLearningCycle({
+    baseThresholds: { overall: 0.10, layout: 0.09, content: 0.11, style: 0.08 },
+    history,
+    realAlerts: [...fpAlerts, ...tpAlerts],
+    falsePositiveAlerts: fpAlerts,
+    truePositiveAlerts: tpAlerts
+  });
+
+  const fpRate = fpAlerts.length / (fpAlerts.length + tpAlerts.length);
+  assert.ok(fpRate > 0.5, `测试场景误报率应>50%，实际=${(fpRate*100).toFixed(0)}%`);
+  assert.equal(result.adjusted, true, '误报率>50%必须调整');
+  assert.ok(result.thresholds.overall > 0.10,
+    `即使误报分数(${fpScores.map(s => s.toFixed(3)).join(',')})远低于阈值0.10，也应提高阈值到${result.thresholds.overall}`);
+
+  console.log(`  场景8: 误报率${(fpRate * 100).toFixed(0)}%，overall阈值从10%→${(result.thresholds.overall * 100).toFixed(2)}%`);
+  console.log(`    调整原因: ${result.reasons.slice(0, 2).join('; ')}`);
+});
+
+test('场景9: 多轮误报标记阈值持续上升，不会因为告警率虚高而过度调整过头', () => {
+  const history = generateHistory(80, 0.05, 0.015);
+  const tpScores = [0.10, 0.11, 0.105, 0.115];
+  const fpBatch = [
+    [0.07],
+    [0.07, 0.065],
+    [0.07, 0.065, 0.072],
+    [0.07, 0.065, 0.072, 0.068]
+  ];
+
+  let thresholds = {
+    overall: 0.08,
+    layout: 0.07,
+    content: 0.09,
+    style: 0.06
+  };
+  const thresholdLog = [{ ...thresholds }];
+
+  for (let round = 0; round < fpBatch.length; round++) {
+    const fpAlerts = fpBatch[round].map((s, i) => ({
+      id: i + 1,
+      url_id: 1,
+      overall_score: s,
+      layout_score: s * 0.6,
+      content_score: s * 0.8,
+      style_score: s * 0.5,
+      is_false_positive: 1,
+      created_at: new Date().toISOString()
+    }));
+    const tpAlerts = tpScores.map((s, i) => ({
+      id: 100 + i,
+      url_id: 1,
+      overall_score: s,
+      layout_score: s * 0.6,
+      content_score: s * 0.8,
+      style_score: s * 0.5,
+      is_false_positive: 0,
+      created_at: new Date().toISOString()
+    }));
+
+    const { result } = simulateFullLearningCycle({
+      baseThresholds: { ...thresholds },
+      history,
+      realAlerts: [...fpAlerts, ...tpAlerts],
+      falsePositiveAlerts: fpAlerts,
+      truePositiveAlerts: tpAlerts
+    });
+
+    if (result.adjusted) {
+      thresholds = { ...result.thresholds };
+    }
+    thresholdLog.push({ ...thresholds });
+  }
+
+  assert.ok(thresholds.overall > thresholdLog[0].overall,
+    `多轮误报后overall阈值应持续上升: ${thresholdLog.map(t => (t.overall * 100).toFixed(2) + '%').join(' → ')}`);
+  assert.ok(thresholds.overall < 0.20,
+    `阈值不应上升过度（<20%），实际=${thresholds.overall.toFixed(3)}`);
+
+  console.log(`  场景9 overall 阈值变化: ${thresholdLog.map(t => (t.overall * 100).toFixed(2) + '%').join(' → ')}`);
 });
 
 console.log('\n所有 thresholdLearner 集成测试通过!');
